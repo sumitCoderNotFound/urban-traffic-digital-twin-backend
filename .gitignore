@@ -1,0 +1,71 @@
+# Copy this content to your .gitignore
+cat > .gitignore << 'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.venv/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# macOS
+.DS_Store
+._*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+urban_twin.db
+
+# Environment Variables
+.env
+.env.local
+
+# Downloaded Images (Large files)
+data/images/*.jpg
+data/images/*.jpeg
+data/images/*.png
+!data/images/.gitkeep
+
+# YOLO Model Files (Large)
+*.pt
+yolov8*.pt
+
+# Detection Results
+data/results/
+runs/
+
+# Logs
+*.log
+logs/
+
+# Test Coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary
+tmp/
+*.tmp
+*.bak
+
+# Archives
+*.zip
+Archive.zip
+EOF
