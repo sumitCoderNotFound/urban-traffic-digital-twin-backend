@@ -1,5 +1,3 @@
-# Copy this content to your .gitignore
-cat > .gitignore << 'EOF'
 # Python
 __pycache__/
 *.py[cod]
@@ -36,15 +34,21 @@ urban_twin.db
 # Environment Variables
 .env
 .env.local
+.env.production
+.env.*
 
 # Downloaded Images (Large files)
 data/images/*.jpg
 data/images/*.jpeg
 data/images/*.png
+data/images/*.mp4
+data/images/*.avi
 !data/images/.gitkeep
 
 # YOLO Model Files (Large)
 *.pt
+*.pth
+*.weights
 yolov8*.pt
 
 # Detection Results
@@ -55,10 +59,16 @@ runs/
 *.log
 logs/
 
+# Uploads
+uploads/
+
 # Test Coverage
 .pytest_cache/
 .coverage
 htmlcov/
+
+# Docker
+.docker/
 
 # Temporary
 tmp/
@@ -68,4 +78,3 @@ tmp/
 # Archives
 *.zip
 Archive.zip
-EOF

@@ -1,0 +1,89 @@
+# Urban Digital Twin - Docker Compose Configuration
+# Run with: docker-compose up -d
+
+version: '3.8'
+
+services:
+  # ===========================================
+  # Backend API
+  # ===========================================
+  api:
+    build:
+      context: .
+      target: development  # Change to 'production' for prod
+    container_name: urban-twin-api
+    ports:
+      - "8000:8000"
+    environment:
+      - DEBUG=true
+      - USE_SQLITE=false
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@db:5432/urban_twin
+      - YOLO_MODEL=yolov8n.pt
+      - YOLO_DEVICE=cpu
+    volumes:
+      - .:/app
+      - ./data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - urban-twin-network
+    restart: unless-stopped
+
+  # ===========================================
+  # PostgreSQL Database
+  # ===========================================
+  db:
+    image: postgres:15-alpine
+    container_name: urban-twin-db
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: urban_twin
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - urban-twin-network
+    restart: unless-stopped
+
+  # ===========================================
+  # pgAdmin (Database UI) - Optional
+  # ===========================================
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: urban-twin-pgadmin
+    ports:
+      - "5050:80"
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@admin.com
+      PGADMIN_DEFAULT_PASSWORD: admin
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      - db
+    networks:
+      - urban-twin-network
+    restart: unless-stopped
+    profiles:
+      - tools  # Only starts with: docker-compose --profile tools up
+
+# ===========================================
+# Networks
+# ===========================================
+networks:
+  urban-twin-network:
+    driver: bridge
+
+# ===========================================
+# Volumes
+# ===========================================
+volumes:
+  postgres_data:
+  pgadmin_data:
