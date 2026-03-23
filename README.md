@@ -3,7 +3,6 @@
 Real-Time Traffic State Estimation using Deep Learning and Live Camera Feeds for Newcastle Digital Twin.
 
 **Author:** Sumit Malviya  
-**Supervisor:** Dr. Jason Moore  
 **University:** Northumbria University  
 **Module:** KF7029 MSc Computer Science Project
 
@@ -299,5 +298,4 @@ This project is part of an MSc dissertation at Northumbria University.
 
 - **Newcastle Urban Observatory** for providing traffic camera data
 - **Ultralytics** for YOLOv8
-- **Dr. Jason Moore** for supervision and guidance
 # urban-traffic-digital-twin-backend

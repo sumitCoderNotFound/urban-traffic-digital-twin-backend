@@ -147,6 +147,8 @@ def is_default_location(lat: float, lon: float) -> bool:
 
 async def update_camera_locations():
     """Fetch all cameras and update any that have default coordinates."""
+    from app.services.urban_observatory import resolve_coordinates as geocode
+
     print("\n📍 Updating camera locations...")
     print("=" * 55)
 
@@ -165,7 +167,7 @@ async def update_camera_locations():
 
         for camera in cameras:
             if is_default_location(camera.latitude, camera.longitude):
-                new_lat, new_lon = resolve_coordinates(camera.name)
+                new_lat, new_lon = await geocode(camera.name)
                 camera.latitude = new_lat
                 camera.longitude = new_lon
                 print(f"   ✅ {camera.name[:45]}")

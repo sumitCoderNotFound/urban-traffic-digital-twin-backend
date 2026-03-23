@@ -81,7 +81,6 @@ def main():
         print("""
 Urban Digital Twin - Backend API
 Author: Sumit Malviya
-Supervisor: Dr. Jason Moore
 Northumbria University
 
 Docs:   http://localhost:8000/api/docs

@@ -78,3 +78,19 @@ tmp/
 # Archives
 *.zip
 Archive.zip
+
+
+# Dataset images (too large for GitHub)
+data/dataset/*.jpg
+data/annotated/*.jpg
+data/training/
+!data/dataset/.gitkeep
+!data/annotated/.gitkeep
+
+# Training runs (large model files)
+runs/detect/*/weights/
+!runs/detect/*/results.png
+!runs/detect/*/confusion_matrix.png
+
+data/Newcastle-Traffic-Detection*/
+*.roboflow.txt

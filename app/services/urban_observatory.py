@@ -1,3 +1,13 @@
+"""
+Urban Observatory Camera Data Collector
+========================================
+Fetches REAL camera images from Newcastle Urban Observatory
+
+Author: Sumit Malviya
+Supervisor: Dr. Jason Moore
+Northumbria University
+"""
+
 import os
 import re
 import asyncio
@@ -25,126 +35,201 @@ class CameraInfo:
 
 
 # ============================================================
-# REAL CAMERA COORDINATES — Newcastle Urban Observatory
-# Manually verified GPS coordinates for known camera locations
-# across Newcastle, Gateshead, Sunderland and Durham regions.
-# These are used as fallback when the API does not return lat/lon.
+# COORDINATE CACHE — pre-resolved for known UO camera locations.
+# Used as instant fallback when Nominatim geocoding is unavailable
+# or for cameras whose place names are ambiguous road numbers.
 # ============================================================
-CAMERA_COORDINATE_LOOKUP = {
-    # ── Newcastle upon Tyne ──────────────────────────────────
-    "A1058 Coast Rd":           (55.0059, -1.5696),
-    "A1058 Coast Road":         (55.0059, -1.5696),
-    "A189 Ponteland Rd":        (55.0012, -1.7189),
-    "A189 Ponteland Road":      (55.0012, -1.7189),
-    "A191 West Moor":           (55.0234, -1.5892),
-    "Haddricks Mill":           (55.0156, -1.5934),
-    "A167 Darlington Rd":       (54.9442, -1.6215),
-    "A167 Darlington Road":     (54.9442, -1.6215),
-    "Neville's X":              (54.9442, -1.6215),
-    "Nevilles Cross":           (54.9434, -1.6312),
-    "Great North Road":         (55.0023, -1.6012),
-    "A1":                       (54.9006, -1.5778),
-
-    # ── Gateshead ────────────────────────────────────────────
-    "A167 Durham Rd, Low Fell": (54.9389, -1.6089),
-    "Low Fell":                 (54.9389, -1.6089),
-    "A184 Felling":             (54.9534, -1.5623),
-    "A184 Felling Bypass":      (54.9534, -1.5623),
-    "Felling Bypass":           (54.9534, -1.5623),
-    "Angel Of The North":       (54.9144, -1.5897),
-    "Angel of the North":       (54.9144, -1.5897),
-    "A1 Birtley":               (54.9006, -1.5778),
-    "Birtley":                  (54.9006, -1.5778),
-    "B1288 Old Durham Rd":      (54.9456, -1.5712),
-    "Old Durham Rd":            (54.9456, -1.5712),
-    "Old Durham Road":          (54.9456, -1.5712),
-    "Blaydon":                  (54.9647, -1.7178),
-    "Lobley Hill":              (54.9456, -1.6312),
-    "Team Valley":              (54.9312, -1.6234),
-    "Dunston":                  (54.9545, -1.6456),
-    "Whickham":                 (54.9478, -1.6934),
-    "Rowlands Gill":            (54.9089, -1.7456),
-    "A692":                     (54.8734, -1.7823),
-    "Consett Rd":               (54.8734, -1.7823),
-    "Consett Road":             (54.8734, -1.7823),
-    "Gateshead":                (54.9526, -1.6014),
-
-    # ── Sunderland ───────────────────────────────────────────
-    "A19 Testos":               (54.9234, -1.5012),
-    "A19 Testo":                (54.9234, -1.5012),
-    "Testo":                    (54.9234, -1.5012),
-    "A1231 Sunderland":         (54.9067, -1.5234),
-    "Pennywell":                (54.9067, -1.5234),
-    "A194 Whitemare":           (54.9912, -1.4456),
-    "Whitemare Pool":           (54.9912, -1.4456),
-    "A194M":                    (54.9912, -1.4456),
-    "Washington":               (54.9001, -1.5234),
-    "Sunderland":               (54.9069, -1.3838),
-
-    # ── County Durham ────────────────────────────────────────
-    "A167 Durham Rd, Birtley":  (54.9045, -1.5823),
-    "Durham Rd, Birtley":       (54.9045, -1.5823),
-    "A690 Durham Rd":           (54.8912, -1.5567),
-    "A690":                     (54.8912, -1.5567),
-    "Houghton":                 (54.8456, -1.4723),
-    "Chester-le-Street":        (54.8589, -1.5712),
-    "Chester Le Street":        (54.8589, -1.5712),
-    "A167 North Rd":            (54.8623, -1.5745),
-    "Stanley":                  (54.8847, -1.6994),
-    "A693 Stanley":             (54.8847, -1.6994),
-    "Durham":                   (54.7753, -1.5849),
-
-    # ── Default fallback ─────────────────────────────────────
-    "Newcastle":                (54.9783, -1.6178),
+COORDINATE_CACHE = {
+    "A1058 Coast Rd":                (55.0059, -1.5696),
+    "A1058 Coast Road":              (55.0059, -1.5696),
+    "A189 Ponteland Rd":             (55.0012, -1.7189),
+    "A189 Ponteland Road":           (55.0012, -1.7189),
+    "A191 West Moor":                (55.0234, -1.5892),
+    "Haddricks Mill":                (55.0156, -1.5934),
+    "Great North Road":              (55.0023, -1.6012),
+    "A167 Darlington Rd":            (54.9442, -1.6215),
+    "A167 Darlington Road":          (54.9442, -1.6215),
+    "Neville's X":                  (54.9442, -1.6215),
+    "A167 Durham Rd, Low Fell":      (54.9389, -1.6089),
+    "Low Fell":                      (54.9389, -1.6089),
+    "A184 Felling":                  (54.9534, -1.5623),
+    "Felling Bypass":                (54.9534, -1.5623),
+    "Angel Of The North":            (54.9144, -1.5897),
+    "Angel of the North":            (54.9144, -1.5897),
+    "A1 Birtley":                    (54.9006, -1.5778),
+    "Birtley":                       (54.9006, -1.5778),
+    "B1288 Old Durham Rd":           (54.9456, -1.5712),
+    "Blaydon":                       (54.9647, -1.7178),
+    "Lobley Hill":                   (54.9456, -1.6312),
+    "Team Valley":                   (54.9312, -1.6234),
+    "Dunston":                       (54.9545, -1.6456),
+    "Whickham":                      (54.9478, -1.6934),
+    "Rowlands Gill":                 (54.9089, -1.7456),
+    "Gateshead":                     (54.9526, -1.6014),
+    "A19 Testos":                    (54.9234, -1.5012),
+    "Testo":                         (54.9234, -1.5012),
+    "Pennywell":                     (54.9067, -1.5234),
+    "Whitemare Pool":                (54.9912, -1.4456),
+    "Washington":                    (54.9001, -1.5234),
+    "Sunderland":                    (54.9069, -1.3838),
+    "A167 Cock O' the North":       (54.8334, -1.5723),
+    "Cock O' the North":            (54.8334, -1.5723),
+    "Duke of Wellington":            (54.8923, -1.5701),
+    "A167 Durham Rd, Birtley":       (54.9045, -1.5823),
+    "A690 Durham Rd":                (54.8912, -1.5567),
+    "Houghton":                      (54.8456, -1.4723),
+    "Chester-le-Street":             (54.8589, -1.5712),
+    "Chester le Street":             (54.8589, -1.5712),
+    "Stanley":                       (54.8847, -1.6994),
+    "Shincliffe":                    (54.7612, -1.5423),
+    "Durham":                        (54.7753, -1.5849),
+    "Darlington":                    (54.5236, -1.5599),
+    "Newcastle":                     (54.9783, -1.6178),
 }
 
+DEFAULT_COORDS = (54.9783, -1.6178)
 
-def lookup_coordinates(camera_name: str) -> tuple:
+
+class GeocoderCache:
     """
-    Look up real GPS coordinates for a camera by its name.
+    Resolves GPS coordinates for camera place names.
 
-    Strategy:
-    1. Try exact match
-    2. Try partial keyword match (longest matching key wins)
-    3. Fall back to Newcastle city centre
+    Strategy (in order):
+    1. In-memory runtime cache — avoids repeat API calls within a session
+    2. Pre-built COORDINATE_CACHE — instant results for known UO locations
+    3. Nominatim (OpenStreetMap) geocoding — for any new/unknown place names,
+       constrained to the North East England bounding box
+    4. Road number fallback — extracts e.g. "A167" and finds nearest match
+    5. Default — Newcastle city centre (54.9783, -1.6178)
 
-    Args:
-        camera_name: Camera name string from Urban Observatory API
-
-    Returns:
-        (latitude, longitude) tuple
+    Nominatim is free and requires no API key. Requests are rate-limited
+    to 1/second per OSM usage policy.
     """
-    if not camera_name:
-        return (54.9783, -1.6178)
 
-    name_upper = camera_name.upper()
+    NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
+    # Bounding box: North East England (minLon, minLat, maxLon, maxLat)
+    BBOX = "-2.2,54.4,-1.2,55.2"
 
-    # 1. Exact match (case-insensitive)
-    for key, coords in CAMERA_COORDINATE_LOOKUP.items():
-        if key.upper() == name_upper:
-            return coords
+    def __init__(self):
+        self._cache: Dict[str, tuple] = {}
 
-    # 2. Partial match — find the longest key that appears in the camera name
-    best_match = None
-    best_len = 0
-    for key, coords in CAMERA_COORDINATE_LOOKUP.items():
-        if key.upper() in name_upper and len(key) > best_len:
-            best_match = coords
-            best_len = len(key)
+    def _cache_key(self, name: str) -> str:
+        return name.strip().upper()
 
-    if best_match:
-        return best_match
+    def _lookup_static(self, name: str) -> Optional[tuple]:
+        """Check COORDINATE_CACHE with exact and partial matching."""
+        name_upper = name.upper()
 
-    # 3. Road number match (e.g. extract "A167" and match)
-    road_match = re.search(r'\b(A\d{1,4}[A-Z]?|B\d{4})\b', camera_name, re.IGNORECASE)
-    if road_match:
-        road_num = road_match.group(1).upper()
-        for key, coords in CAMERA_COORDINATE_LOOKUP.items():
-            if road_num in key.upper():
+        # Exact match
+        for key, coords in COORDINATE_CACHE.items():
+            if key.upper() == name_upper:
                 return coords
 
-    # 4. Fallback: Newcastle city centre
-    return (54.9783, -1.6178)
+        # Longest partial match
+        best, best_len = None, 0
+        for key, coords in COORDINATE_CACHE.items():
+            if key.upper() in name_upper and len(key) > best_len:
+                best, best_len = coords, len(key)
+
+        return best
+
+    def _lookup_road_number(self, name: str) -> Optional[tuple]:
+        """Extract road number (e.g. A167) and find nearest static entry."""
+        match = re.search(r'\b(A\d{1,4}[A-Z]?|B\d{4})\b', name, re.IGNORECASE)
+        if not match:
+            return None
+        road = match.group(1).upper()
+        for key, coords in COORDINATE_CACHE.items():
+            if road in key.upper():
+                return coords
+        return None
+
+    async def geocode(self, place_name: str) -> tuple:
+        """
+        Resolve GPS coordinates for a place name.
+        Uses Nominatim geocoding with COORDINATE_CACHE as fast fallback.
+        """
+        if not place_name or not place_name.strip():
+            return DEFAULT_COORDS
+
+        key = self._cache_key(place_name)
+
+        # 1. Runtime cache
+        if key in self._cache:
+            return self._cache[key]
+
+        # 2. Static cache
+        static = self._lookup_static(place_name)
+        if static:
+            self._cache[key] = static
+            return static
+
+        # 3. Nominatim geocoding
+        coords = await self._nominatim_geocode(place_name)
+        if coords:
+            self._cache[key] = coords
+            print(f"   🗺️  Geocoded: {place_name[:45]} → {coords}")
+            return coords
+
+        # 4. Road number fallback
+        road_fallback = self._lookup_road_number(place_name)
+        if road_fallback:
+            self._cache[key] = road_fallback
+            return road_fallback
+
+        # 5. Default
+        self._cache[key] = DEFAULT_COORDS
+        return DEFAULT_COORDS
+
+    async def _nominatim_geocode(self, place_name: str) -> Optional[tuple]:
+        """Call Nominatim API to geocode a place name within NE England."""
+        # Clean up the query — remove truncation artifacts
+        query = re.sub(r'\bRbt\b', 'Roundabout', place_name)
+        query = f"{query}, England"
+
+        params = {
+            "q": query,
+            "format": "json",
+            "limit": 1,
+            "viewbox": self.BBOX,
+            "bounded": 1,
+            "countrycodes": "gb",
+        }
+
+        headers = {
+            "User-Agent": "UrbanDigitalTwin/1.0 (MSc Research - Northumbria University)",
+            "Accept-Language": "en",
+        }
+
+        try:
+            timeout = aiohttp.ClientTimeout(total=5)
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    self.NOMINATIM_URL,
+                    params=params,
+                    headers=headers
+                ) as response:
+                    if response.status == 200:
+                        results = await response.json()
+                        if results:
+                            lat = float(results[0]["lat"])
+                            lon = float(results[0]["lon"])
+                            # Sanity check — must be in North East England
+                            if 54.3 < lat < 55.3 and -2.3 < lon < -1.0:
+                                return (round(lat, 6), round(lon, 6))
+        except Exception:
+            pass  # Fall through to static fallback
+
+        return None
+
+
+# Module-level geocoder instance (shared across all requests)
+_geocoder = GeocoderCache()
+
+
+async def resolve_coordinates(place_name: str) -> tuple:
+    """Public interface — resolve GPS coords for a camera place name."""
+    return await _geocoder.geocode(place_name)
 
 
 class UrbanObservatoryCollector:
@@ -195,7 +280,7 @@ class UrbanObservatoryCollector:
                         items = data if isinstance(data, list) else data.get('cameras', data.get('items', []))
 
                         for item in items:
-                            camera = self._parse_camera_item(item)
+                            camera = await self._parse_camera_item(item)
                             if camera:
                                 cameras.append(camera)
 
@@ -209,13 +294,13 @@ class UrbanObservatoryCollector:
             print(f"   ❌ API error: {e}")
             return []
 
-    def _parse_camera_item(self, item: Dict) -> Optional[Dict]:
+    async def _parse_camera_item(self, item: Dict) -> Optional[Dict]:
         """
         Parse a camera item from the Urban Observatory API response.
 
         Coordinate resolution order:
         1. Use lat/lon from API response if valid (not 0.0 or missing)
-        2. Fall back to lookup_coordinates() using camera name
+        2. Fall back to resolve_coordinates() using Nominatim geocoding
         """
         try:
             safe_path = item.get('safe_photo_path', '')
@@ -223,7 +308,10 @@ class UrbanObservatoryCollector:
             # Build image URL — keep safe_photo_path as-is (do NOT decode slashes)
             image_url = f"{self.PHOTO_BASE_URL}/{safe_path}" if safe_path else ''
 
-            camera_name = item.get('short_description', item.get('name', ''))
+            # UO API: 'place' is full road name, 'short_description' is truncated
+            place       = item.get('place', '')
+            short_desc  = item.get('short_description', item.get('name', ''))
+            camera_name = place or short_desc
 
             camera_id = (
                 item.get('id') or
@@ -232,24 +320,22 @@ class UrbanObservatoryCollector:
                 f"camera_{len(self.cameras_cache)}"
             )
 
-            # ── Coordinate resolution ──────────────────────────
+            # UO API does not return lat/lon — resolve from place name
             api_lat = item.get('lat', item.get('latitude', None))
             api_lon = item.get('lon', item.get('longitude', None))
 
-            # Use API coords only if they are valid (non-zero, non-null)
             if api_lat and api_lon and float(api_lat) != 0.0 and float(api_lon) != 0.0:
                 latitude = float(api_lat)
                 longitude = float(api_lon)
             else:
-                # Fall back to name-based lookup
-                latitude, longitude = lookup_coordinates(camera_name)
+                # Try full place name first (more complete than short_description)
+                latitude, longitude = await resolve_coordinates(place or short_desc)
 
             return {
                 'camera_id': camera_id,
                 'name': camera_name or camera_id,
-                'short_description': camera_name,
-                'place': item.get('place', 'Newcastle'),
-                'latitude': latitude,
+                'short_description': short_desc,
+                'place': place or 'Newcastle',
                 'longitude': longitude,
                 'image_url': image_url,
                 'safe_photo_path': safe_path,
