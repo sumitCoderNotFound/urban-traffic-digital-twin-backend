@@ -94,3 +94,18 @@ runs/detect/*/weights/
 
 data/Newcastle-Traffic-Detection*/
 *.roboflow.txt
+# Dataset images (too large for git)
+data/uo_dataset/
+data/uo_dataset_2/
+data/minority_class_collection/
+data/test_set_for_annotation/
+data/ground_truth/
+data/annotated/
+data/images/
+data/Newcastle-Traffic-Detection*/
+data/ground_truth_filtered*/
+data/ground_truth_roboflow/
+data/extra_annotation_batch/
+data/newcastle_dataset/
+data/results/
+data/
