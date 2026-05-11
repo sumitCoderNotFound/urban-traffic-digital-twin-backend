@@ -1,676 +1,521 @@
 """
-RQ1_RQ2_FINAL_EVALUATION.py
-============================
-Proper evaluation on HELD-OUT TEST SET ONLY (78 images)
-No training data contamination.
-
-Evaluates:
-  - RQ1: Baseline YOLOv8n (COCO pre-trained)
-  - RQ2: Fine-tuned YOLOv8n (Newcastle-specific)
-
-Metrics:
-  - mAP@0.5 (standard)
-  - mAP@0.5:0.95 (COCO standard)
-  - Per-class P, R, F1, AP
-  - Per-camera breakdown
-  - Day vs Night performance
-  - Confidence threshold analysis
-
-HOW TO RUN:
-    cd urban-digital-twin-backend
-    python scripts/rq1_rq2_final_evaluation.py
+RQ1 + RQ2 Final Evaluation — FIXED VERSION
+============================================
+Fixes applied:
+  1. Greedy matching: only zero row/col on valid class-consistent match
+  2. mAP@0.5:0.95: proper AP computation at each IoU threshold
+  3. Per-class AP@0.5:0.95 output
+  4. IMGSZ=960 to match training
+  5. Proper confusion matrix (class-to-class)
+  6. Full CSV export (overall, day/night, per-camera, per-class AP50:95)
+  7. Correct dataset numbers (344 test, 44 cameras)
 
 Author: Sumit Malviya (W24041293)
-Supervisor: Dr. Jason Moore
-Module: KF7029 MSc Project
 """
 
-import os
-import csv
-import time
+import os, re, time, csv
 import numpy as np
-import matplotlib
-import matplotlib.pyplot as plt
-from collections import defaultdict
 from pathlib import Path
-
-matplotlib.rcParams['figure.figsize'] = (12, 6)
-matplotlib.rcParams['font.size'] = 11
-plt.style.use('seaborn-v0_8-whitegrid')
+from collections import defaultdict
+from ultralytics import YOLO
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-BASELINE_MODEL = "yolov8n.pt"
-FINETUNED_MODEL = "runs/detect/newcastle_finetune2/weights/best.pt"
-TEST_DIR = "data/Newcastle-Traffic-Detection.v2i.yolov8/test"
-RESULTS_DIR = "data/results/final_evaluation"
+BASELINE_MODEL_PATH = "yolov8n.pt"
+FINETUNED_MODEL_PATH = "runs/detect/newcastle_v6_improved/weights/best.pt"
+DATASET_DIR = Path("data/Newcastle-Traffic-Detection.v6i.yolov8")
+TEST_DIR = DATASET_DIR / "test"
+RESULTS_DIR = Path("data/results")
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
 
 CONF = 0.25
 DEVICE = "cpu"
-IMGSZ = 640
+IMGSZ = 960  # FIX #4: match training resolution
 
-# Class mapping: Roboflow class IDs
-RF_NAMES = {0: 'Traffic light', 1: 'Bus', 2: 'Car', 3: 'Person', 4: 'Truck'}
-
-# COCO class IDs -> Roboflow class IDs (for baseline model)
-COCO_TO_RF = {9: 0, 5: 1, 2: 2, 0: 3, 7: 4}
-
-# IoU thresholds for mAP@0.5:0.95
+RF_NAMES = {0:"Motorcycle", 1:"Roadwork", 2:"Traffic light", 3:"bicycle",
+            4:"bus", 5:"car", 6:"person", 7:"truck"}
+COCO_TO_RF = {3:0, 9:2, 1:3, 5:4, 2:5, 0:6, 7:7}
 IOU_THRESHOLDS = np.arange(0.5, 1.0, 0.05)
-
-# Day/Night classification based on hour in filename
-# Filename format: CameraName__YYYYMMDD_HHMMSS_hash.jpg
-DAY_HOURS = range(7, 18)   # 07:00 - 17:59
-NIGHT_HOURS = list(range(0, 7)) + list(range(18, 24))  # 00:00-06:59, 18:00-23:59
-
-os.makedirs(RESULTS_DIR, exist_ok=True)
+NUM_CLASSES = len(RF_NAMES)
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# FIX #1: Correct greedy matching — only zero on class match
 # ============================================================
 def compute_iou(b1, b2):
-    """Compute IoU between two boxes in [x_center, y_center, w, h] format (normalized)."""
-    x1 = max(b1[0] - b1[2]/2, b2[0] - b2[2]/2)
-    y1 = max(b1[1] - b1[3]/2, b2[1] - b2[3]/2)
-    x2 = min(b1[0] + b1[2]/2, b2[0] + b2[2]/2)
-    y2 = min(b1[1] + b1[3]/2, b2[1] + b2[3]/2)
-    inter = max(0, x2 - x1) * max(0, y2 - y1)
-    union = (b1[2] * b1[3]) + (b2[2] * b2[3]) - inter
-    return inter / union if union > 0 else 0.0
+    x1 = max(b1[0]-b1[2]/2, b2[0]-b2[2]/2)
+    y1 = max(b1[1]-b1[3]/2, b2[1]-b2[3]/2)
+    x2 = min(b1[0]+b1[2]/2, b2[0]+b2[2]/2)
+    y2 = min(b1[1]+b1[3]/2, b2[1]+b2[3]/2)
+    inter = max(0, x2-x1) * max(0, y2-y1)
+    union = b1[2]*b1[3] + b2[2]*b2[3] - inter
+    return inter / union if union > 0 else 0
 
 
+def greedy_match_fixed(preds, gts, iou_thr=0.5):
+    """
+    FIX #1: Only zero out row/column when class-consistent match is accepted.
+    Wrong-class high-IoU pairs no longer block correct later matches.
+    """
+    if not preds or not gts:
+        return [], list(range(len(preds))), list(range(len(gts)))
+
+    M = np.zeros((len(preds), len(gts)))
+    for i, p in enumerate(preds):
+        for j, g in enumerate(gts):
+            # Only compute IoU for same-class pairs
+            if p["class"] == g["class"]:
+                M[i, j] = compute_iou(p["box"], g["box"])
+
+    matches, matched_p, matched_g = [], set(), set()
+    while True:
+        if M.size == 0:
+            break
+        mx = M.max()
+        if mx < iou_thr:
+            break
+        pi, gi = np.unravel_index(M.argmax(), M.shape)
+        pi, gi = int(pi), int(gi)
+        # Class already matches (we only filled same-class IoU)
+        matches.append((pi, gi, mx))
+        matched_p.add(pi)
+        matched_g.add(gi)
+        M[pi, :] = 0
+        M[:, gi] = 0
+
+    unmatched_p = [i for i in range(len(preds)) if i not in matched_p]
+    unmatched_g = [i for i in range(len(gts)) if i not in matched_g]
+    return matches, unmatched_p, unmatched_g
+
+
+# ============================================================
+# FIX #2: Correct AP computation (11-point interpolation)
+# ============================================================
+def compute_ap_11point(confidences_and_tps, total_gt):
+    """
+    Given list of (confidence, is_tp) sorted by confidence desc,
+    compute AP using 11-point interpolation.
+    """
+    if not confidences_and_tps or total_gt == 0:
+        return 0.0
+
+    sorted_dets = sorted(confidences_and_tps, key=lambda x: x[0], reverse=True)
+    tp_cumsum = 0
+    fp_cumsum = 0
+    precisions = []
+    recalls = []
+
+    for conf, is_tp in sorted_dets:
+        if is_tp:
+            tp_cumsum += 1
+        else:
+            fp_cumsum += 1
+        precisions.append(tp_cumsum / (tp_cumsum + fp_cumsum))
+        recalls.append(tp_cumsum / total_gt)
+
+    # 11-point interpolation
+    ap = 0.0
+    for t in np.arange(0, 1.1, 0.1):
+        p_at_r = [p for p, r in zip(precisions, recalls) if r >= t]
+        ap += max(p_at_r) if p_at_r else 0
+    return ap / 11.0
+
+
+# ============================================================
+# HELPERS
+# ============================================================
 def load_gt(label_path):
-    """Load ground truth boxes from YOLO format label file."""
     boxes = []
     if not os.path.exists(label_path):
         return boxes
     for line in open(label_path):
         parts = line.strip().split()
         if len(parts) >= 5:
-            c = int(parts[0])
-            x, y, w, h = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-            boxes.append({'class': c, 'box': [x, y, w, h], 'area': w * h})
+            boxes.append({"class": int(parts[0]),
+                          "box": [float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])]})
     return boxes
 
 
-def match_detections(preds, gts, iou_thr=0.5):
-    """Match predictions to ground truth using greedy IoU matching."""
-    if not preds or not gts:
-        return [], list(range(len(preds))), list(range(len(gts)))
-
-    iou_matrix = np.zeros((len(preds), len(gts)))
-    for i, p in enumerate(preds):
-        for j, g in enumerate(gts):
-            iou_matrix[i, j] = compute_iou(p['box'], g['box'])
-
-    matches = []
-    matched_preds = set()
-    matched_gts = set()
-
-    while True:
-        if iou_matrix.size == 0:
-            break
-        max_iou = iou_matrix.max()
-        if max_iou < iou_thr:
-            break
-        pi, gi = np.unravel_index(iou_matrix.argmax(), iou_matrix.shape)
-        pi, gi = int(pi), int(gi)
-        if preds[pi]['class'] == gts[gi]['class']:
-            matches.append((pi, gi, max_iou))
-            matched_preds.add(pi)
-            matched_gts.add(gi)
-        iou_matrix[pi, :] = 0
-        iou_matrix[:, gi] = 0
-
-    unmatched_preds = [i for i in range(len(preds)) if i not in matched_preds]
-    unmatched_gts = [i for i in range(len(gts)) if i not in matched_gts]
-    return matches, unmatched_preds, unmatched_gts
-
-
-def compute_ap_11point(precisions, recalls):
-    """Compute AP using 11-point interpolation."""
-    if not precisions:
-        return 0.0
-    pairs = sorted(zip(recalls, precisions))
-    rs = [p[0] for p in pairs]
-    ps = [p[1] for p in pairs]
-    ap = 0.0
-    for t in np.arange(0, 1.1, 0.1):
-        matching = [p for p, r in zip(ps, rs) if r >= t]
-        ap += max(matching) if matching else 0
-    return ap / 11.0
-
-
-def parse_hour_from_filename(filename):
-    """Extract hour from filename for day/night classification."""
-    import re
-    # Try pattern: YYYYMMDD_HHMMSS
-    match = re.search(r'(\d{8})_(\d{6})', filename)
-    if match:
-        return int(match.group(2)[:2])
+def parse_hour(filename):
+    m = re.search(r"(\d{8})_(\d{6})", filename)
+    if m:
+        h = int(m.group(2)[:2])
+        return h if 0 <= h <= 23 else None
     return None
-
-
-def get_time_period(hour):
-    """Classify hour as day or night."""
-    if hour is None:
-        return "unknown"
-    if hour in DAY_HOURS:
-        return "day"
-    return "night"
-
-
-def collect_test_dataset(test_dir):
-    """Collect all image-label pairs from the test directory."""
-    pairs = []
-    img_dir = Path(test_dir) / "images"
-    lbl_dir = Path(test_dir) / "labels"
-
-    if not img_dir.exists():
-        print(f"ERROR: {img_dir} not found!")
-        return pairs
-
-    for img_path in sorted(img_dir.glob("*")):
-        if img_path.suffix.lower() not in {'.jpg', '.jpeg', '.png'}:
-            continue
-
-        label_path = lbl_dir / f"{img_path.stem}.txt"
-        hour = parse_hour_from_filename(img_path.name)
-        period = get_time_period(hour)
-
-        # Extract camera name from filename (before __YYYYMMDD)
-        parts = img_path.stem.split('__')
-        camera = parts[0] if len(parts) >= 2 else img_path.stem.split('_')[0]
-
-        pairs.append({
-            'image': str(img_path),
-            'label': str(label_path),
-            'filename': img_path.name,
-            'camera': camera,
-            'hour': hour,
-            'period': period,
-        })
-
-    return pairs
 
 
 # ============================================================
 # MAIN EVALUATION ENGINE
 # ============================================================
-def evaluate_model(model, dataset, model_name, is_finetuned=False):
-    """
-    Run full evaluation of a model on the test dataset.
-    Computes mAP@0.5, mAP@0.5:0.95, per-class, per-camera, day/night metrics.
-    """
-    print(f"\n{'='*60}")
-    print(f"  EVALUATING: {model_name}")
-    print(f"  Test images: {len(dataset)}")
-    print(f"{'='*60}")
+def evaluate_model(model, test_data, model_name, is_baseline=False):
+    print(f"\n{'='*70}")
+    print(f"  Evaluating: {model_name}")
+    print(f"  Test images: {len(test_data)}  |  IMGSZ: {IMGSZ}  |  Conf: {CONF}")
+    print(f"{'='*70}")
 
-    # Storage for metrics
-    class_stats = defaultdict(lambda: {'TP': 0, 'FP': 0, 'FN': 0})
-    camera_stats = defaultdict(lambda: {'TP': 0, 'FP': 0, 'FN': 0})
-    period_stats = defaultdict(lambda: defaultdict(lambda: {'TP': 0, 'FP': 0, 'FN': 0}))
-    pred_confidences = defaultdict(list)  # class -> [(conf, is_tp)]
-    per_image = []
+    # Storage
+    class_stats = defaultdict(lambda: {"TP": 0, "FP": 0, "FN": 0})
+    period_stats = defaultdict(lambda: defaultdict(lambda: {"TP": 0, "FP": 0, "FN": 0}))
+    camera_stats = defaultdict(lambda: {"TP": 0, "FP": 0, "FN": 0, "GT": 0})
+    per_class_confs = defaultdict(list)  # class -> [(conf, is_tp)] at IoU=0.5
 
-    # For mAP@0.5:0.95 - need per-threshold stats
-    threshold_class_stats = {
-        iou_t: defaultdict(lambda: {'TP': 0, 'FP': 0, 'FN': 0})
-        for iou_t in IOU_THRESHOLDS
+    # FIX #2: per-class confidence lists at EACH IoU threshold
+    per_class_confs_strict = {
+        round(t, 2): defaultdict(list) for t in IOU_THRESHOLDS
     }
 
-    start_time = time.time()
+    # FIX #5: confusion matrix (class-to-class + background)
+    # conf_matrix[pred_class][gt_class] counts
+    conf_matrix = np.zeros((NUM_CLASSES + 1, NUM_CLASSES + 1))  # +1 for background
 
-    for idx, item in enumerate(dataset):
-        gts = load_gt(item['label'])
+    t0 = time.time()
 
-        # Run inference
-        results = model.predict(
-            source=item['image'],
-            conf=CONF,
-            verbose=False,
-            device=DEVICE,
-            imgsz=IMGSZ
-        )
+    for idx, item in enumerate(test_data):
+        gts = load_gt(item["label"])
+        results = model.predict(source=item["image"], conf=CONF, verbose=False,
+                                device=DEVICE, imgsz=IMGSZ)
 
-        # Convert predictions to common format
         preds = []
-        for box in results[0].boxes:
-            coco_cls = int(box.cls[0])
-            if is_finetuned:
-                # Fine-tuned model already uses Roboflow classes (0-4)
-                if coco_cls in RF_NAMES:
-                    preds.append({
-                        'class': coco_cls,
-                        'box': box.xywhn[0].tolist(),
-                        'conf': float(box.conf[0])
-                    })
+        for b in results[0].boxes:
+            cid = int(b.cls[0])
+            conf = float(b.conf[0])
+            box = b.xywhn[0].tolist()
+            if is_baseline:
+                if cid in COCO_TO_RF:
+                    preds.append({"class": COCO_TO_RF[cid], "box": box, "conf": conf})
             else:
-                # Baseline uses COCO classes, need to map
-                if coco_cls in COCO_TO_RF:
-                    preds.append({
-                        'class': COCO_TO_RF[coco_cls],
-                        'box': box.xywhn[0].tolist(),
-                        'conf': float(box.conf[0])
-                    })
+                if cid in RF_NAMES:
+                    preds.append({"class": cid, "box": box, "conf": conf})
 
-        camera = item['camera']
-        period = item['period']
+        # --- IoU=0.5 matching (main metrics) ---
+        matches, unmatched_p, unmatched_g = greedy_match_fixed(preds, gts, 0.5)
 
-        # Match at IoU=0.5 for main metrics
-        matches, unmatched_p, unmatched_g = match_detections(preds, gts, iou_thr=0.5)
-
-        img_tp = img_fp = img_fn = 0
-
-        for pi, gi, _ in matches:
-            c = preds[pi]['class']
-            class_stats[c]['TP'] += 1
-            camera_stats[camera]['TP'] += 1
-            period_stats[period][c]['TP'] += 1
-            pred_confidences[c].append((preds[pi]['conf'], True))
-            img_tp += 1
+        for pi, gi, iou in matches:
+            c = preds[pi]["class"]
+            class_stats[c]["TP"] += 1
+            period_stats[item["period"]][c]["TP"] += 1
+            camera_stats[item["camera"]]["TP"] += 1
+            per_class_confs[c].append((preds[pi]["conf"], True))
+            conf_matrix[c][c] += 1  # correct prediction
 
         for pi in unmatched_p:
-            c = preds[pi]['class']
-            class_stats[c]['FP'] += 1
-            camera_stats[camera]['FP'] += 1
-            period_stats[period][c]['FP'] += 1
-            pred_confidences[c].append((preds[pi]['conf'], False))
-            img_fp += 1
+            c = preds[pi]["class"]
+            class_stats[c]["FP"] += 1
+            period_stats[item["period"]][c]["FP"] += 1
+            camera_stats[item["camera"]]["FP"] += 1
+            per_class_confs[c].append((preds[pi]["conf"], False))
+            # FIX #5: FP goes to pred_class row, background column
+            conf_matrix[c][NUM_CLASSES] += 1
 
         for gi in unmatched_g:
-            c = gts[gi]['class']
-            class_stats[c]['FN'] += 1
-            camera_stats[camera]['FN'] += 1
-            period_stats[period][c]['FN'] += 1
-            img_fn += 1
+            c = gts[gi]["class"]
+            class_stats[c]["FN"] += 1
+            period_stats[item["period"]][c]["FN"] += 1
+            camera_stats[item["camera"]]["FN"] += 1
+            # FIX #5: FN goes to background row, gt_class column
+            conf_matrix[NUM_CLASSES][c] += 1
 
-        # Per-image metrics
-        p = img_tp / (img_tp + img_fp) if (img_tp + img_fp) > 0 else 0
-        r = img_tp / (img_tp + img_fn) if (img_tp + img_fn) > 0 else 0
-        f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
+        for g in gts:
+            camera_stats[item["camera"]]["GT"] += 1
 
-        per_image.append({
-            'file': item['filename'], 'camera': camera, 'period': period,
-            'hour': item['hour'], 'gt': len(gts), 'pred': len(preds),
-            'TP': img_tp, 'FP': img_fp, 'FN': img_fn,
-            'P': round(p, 4), 'R': round(r, 4), 'F1': round(f1, 4)
-        })
+        # --- FIX #5: Build real class-to-class confusion ---
+        # For FP with wrong class, find closest GT and record confusion
+        # (simplified: check all unmatched preds against all unmatched GTs)
+        for pi in unmatched_p:
+            pred_c = preds[pi]["class"]
+            best_iou = 0
+            best_gt_c = None
+            for gi in unmatched_g:
+                iou = compute_iou(preds[pi]["box"], gts[gi]["box"])
+                if iou > best_iou and iou >= 0.3:  # loose threshold for confusion
+                    best_iou = iou
+                    best_gt_c = gts[gi]["class"]
+            if best_gt_c is not None and best_gt_c != pred_c:
+                # Class confusion: predicted as pred_c, was actually best_gt_c
+                conf_matrix[pred_c][best_gt_c] += 1
+                conf_matrix[pred_c][NUM_CLASSES] -= 1  # remove from background column
 
-        # Also compute matches at all IoU thresholds for mAP@0.5:0.95
-        for iou_t in IOU_THRESHOLDS:
-            mt, up, ug = match_detections(preds, gts, iou_thr=iou_t)
+        # --- Multi-threshold matching for mAP@0.5:0.95 ---
+        for iou_thr in IOU_THRESHOLDS:
+            k = round(iou_thr, 2)
+            mt, up, ug = greedy_match_fixed(preds, gts, iou_thr)
+            matched_pred_set = set()
             for pi, gi, _ in mt:
-                c = preds[pi]['class']
-                threshold_class_stats[iou_t][c]['TP'] += 1
+                c = preds[pi]["class"]
+                per_class_confs_strict[k][c].append((preds[pi]["conf"], True))
+                matched_pred_set.add(pi)
             for pi in up:
-                c = preds[pi]['class']
-                threshold_class_stats[iou_t][c]['FP'] += 1
-            for gi in ug:
-                c = gts[gi]['class']
-                threshold_class_stats[iou_t][c]['FN'] += 1
+                c = preds[pi]["class"]
+                per_class_confs_strict[k][c].append((preds[pi]["conf"], False))
 
-        if (idx + 1) % 20 == 0:
-            print(f"  [{idx+1}/{len(dataset)}] processed")
+        if (idx + 1) % 50 == 0:
+            print(f"  [{idx+1}/{len(test_data)}]")
 
-    elapsed = time.time() - start_time
-    print(f"  Done in {elapsed:.1f}s")
+    elapsed = time.time() - t0
+    print(f"  Done in {elapsed:.0f}s ({elapsed/len(test_data):.2f}s/img)")
 
-    # ---- Compute per-class metrics at IoU=0.5 ----
+    # ================================================================
+    # COMPUTE PER-CLASS METRICS
+    # ================================================================
     per_class = []
-    aps_50 = []
+    all_aps_50 = []
+
+    # FIX #2 + #3: Compute proper AP at each IoU threshold per class
+    per_class_ap50_95 = []
+
     for cid in sorted(RF_NAMES.keys()):
         s = class_stats[cid]
-        tp, fp, fn = s['TP'], s['FP'], s['FN']
+        tp, fp, fn = s["TP"], s["FP"], s["FN"]
+        gt = tp + fn
         p = tp / (tp + fp) if (tp + fp) > 0 else 0
         r = tp / (tp + fn) if (tp + fn) > 0 else 0
         f1 = 2 * p * r / (p + r) if (p + r) > 0 else 0
 
-        # AP from confidence-sorted predictions
-        confs = pred_confidences[cid]
-        if confs:
-            sorted_confs = sorted(confs, key=lambda x: x[0], reverse=True)
-            running_tp = running_fp = 0
-            total_gt = tp + fn
-            precs, recs = [], []
-            for conf_val, is_tp in sorted_confs:
-                if is_tp:
-                    running_tp += 1
-                else:
-                    running_fp += 1
-                precs.append(running_tp / (running_tp + running_fp))
-                recs.append(running_tp / total_gt if total_gt > 0 else 0)
-            ap = compute_ap_11point(precs, recs)
-        else:
-            ap = 0.0
+        # AP@0.5
+        ap50 = compute_ap_11point(per_class_confs[cid], gt)
+        all_aps_50.append(ap50)
 
-        aps_50.append(ap)
+        # FIX #2: Proper AP at each IoU threshold, then average
+        aps_at_thresholds = []
+        for iou_thr in IOU_THRESHOLDS:
+            k = round(iou_thr, 2)
+            class_gt = gt  # same GT count regardless of IoU threshold
+            ap_at_t = compute_ap_11point(per_class_confs_strict[k][cid], class_gt)
+            aps_at_thresholds.append(ap_at_t)
+        ap50_95 = np.mean(aps_at_thresholds)
+        per_class_ap50_95.append(ap50_95)
+
         per_class.append({
-            'class': RF_NAMES[cid], 'TP': tp, 'FP': fp, 'FN': fn,
-            'P': round(p, 4), 'R': round(r, 4), 'F1': round(f1, 4),
-            'AP50': round(ap, 4)
+            "cid": cid, "name": RF_NAMES[cid], "GT": gt,
+            "TP": tp, "FP": fp, "FN": fn,
+            "P": p, "R": r, "F1": f1,
+            "AP50": ap50, "AP50_95": ap50_95   # FIX #3: include AP50:95
         })
 
-    # ---- Compute mAP@0.5:0.95 ----
-    aps_per_threshold = []
-    for iou_t in IOU_THRESHOLDS:
-        threshold_aps = []
-        for cid in sorted(RF_NAMES.keys()):
-            s = threshold_class_stats[iou_t][cid]
-            tp, fp, fn = s['TP'], s['FP'], s['FN']
-            # Simplified AP at this threshold
-            p = tp / (tp + fp) if (tp + fp) > 0 else 0
-            r = tp / (tp + fn) if (tp + fn) > 0 else 0
-            threshold_aps.append(p * r / max(p + r, 1e-6) * 2 if (p + r) > 0 else 0)
-        aps_per_threshold.append(np.mean(threshold_aps))
+    mAP50 = np.mean(all_aps_50)
+    mAP50_95 = np.mean(per_class_ap50_95)
 
-    # Per-class mAP@0.5:0.95
-    per_class_map5095 = []
-    for cid in sorted(RF_NAMES.keys()):
-        class_aps = []
-        for iou_t in IOU_THRESHOLDS:
-            s = threshold_class_stats[iou_t][cid]
-            tp, fn = s['TP'], s['FN']
-            r = tp / (tp + fn) if (tp + fn) > 0 else 0
-            class_aps.append(r)  # recall at each threshold
-        per_class_map5095.append(np.mean(class_aps))
-
-    # Add mAP@0.5:0.95 to per_class
-    for i, pc in enumerate(per_class):
-        pc['AP50_95'] = round(per_class_map5095[i], 4)
-
-    # ---- Overall metrics ----
-    total_tp = sum(class_stats[c]['TP'] for c in RF_NAMES)
-    total_fp = sum(class_stats[c]['FP'] for c in RF_NAMES)
-    total_fn = sum(class_stats[c]['FN'] for c in RF_NAMES)
-    overall_p = total_tp / (total_tp + total_fp) if (total_tp + total_fp) > 0 else 0
-    overall_r = total_tp / (total_tp + total_fn) if (total_tp + total_fn) > 0 else 0
-    overall_f1 = 2 * overall_p * overall_r / (overall_p + overall_r) if (overall_p + overall_r) > 0 else 0
-    mAP50 = np.mean(aps_50)
-    mAP50_95 = np.mean(per_class_map5095)
-
-    overall = {
-        'model': model_name,
-        'images': len(dataset),
-        'gt_objects': total_tp + total_fn,
-        'predictions': total_tp + total_fp,
-        'TP': total_tp, 'FP': total_fp, 'FN': total_fn,
-        'P': round(overall_p, 4), 'R': round(overall_r, 4), 'F1': round(overall_f1, 4),
-        'mAP50': round(mAP50, 4), 'mAP50_95': round(mAP50_95, 4),
-    }
-
-    # ---- Day vs Night metrics ----
-    day_night = {}
-    for period in ['day', 'night']:
-        p_stats = period_stats[period]
-        p_tp = sum(p_stats[c]['TP'] for c in RF_NAMES)
-        p_fp = sum(p_stats[c]['FP'] for c in RF_NAMES)
-        p_fn = sum(p_stats[c]['FN'] for c in RF_NAMES)
-        pp = p_tp / (p_tp + p_fp) if (p_tp + p_fp) > 0 else 0
-        pr = p_tp / (p_tp + p_fn) if (p_tp + p_fn) > 0 else 0
-        pf = 2 * pp * pr / (pp + pr) if (pp + pr) > 0 else 0
-        n_images = sum(1 for img in per_image if img['period'] == period)
-        day_night[period] = {
-            'images': n_images,
-            'TP': p_tp, 'FP': p_fp, 'FN': p_fn,
-            'P': round(pp, 4), 'R': round(pr, 4), 'F1': round(pf, 4)
-        }
-
-    # ---- Per-camera metrics ----
-    per_camera = []
-    for cam in sorted(camera_stats.keys()):
-        s = camera_stats[cam]
-        cp = s['TP'] / (s['TP'] + s['FP']) if (s['TP'] + s['FP']) > 0 else 0
-        cr = s['TP'] / (s['TP'] + s['FN']) if (s['TP'] + s['FN']) > 0 else 0
-        cf = 2 * cp * cr / (cp + cr) if (cp + cr) > 0 else 0
-        per_camera.append({
-            'camera': cam, 'TP': s['TP'], 'FP': s['FP'], 'FN': s['FN'],
-            'P': round(cp, 4), 'R': round(cr, 4), 'F1': round(cf, 4)
-        })
-
-    # ---- Confidence threshold analysis ----
-    conf_analysis = []
-    for thr in [0.25, 0.3, 0.35, 0.4, 0.5, 0.6, 0.7]:
-        t_tp = t_fp = t_missed_tp = 0
-        for c in RF_NAMES:
-            for conf_val, is_tp in pred_confidences[c]:
-                if conf_val >= thr:
-                    if is_tp: t_tp += 1
-                    else: t_fp += 1
-                else:
-                    if is_tp: t_missed_tp += 1
-        t_fn = total_fn + t_missed_tp
-        cp = t_tp / (t_tp + t_fp) if (t_tp + t_fp) > 0 else 0
-        cr = t_tp / (t_tp + t_fn) if (t_tp + t_fn) > 0 else 0
-        cf = 2 * cp * cr / (cp + cr) if (cp + cr) > 0 else 0
-        conf_analysis.append({'threshold': thr, 'P': round(cp, 4), 'R': round(cr, 4), 'F1': round(cf, 4)})
-
-    # Print summary
-    print(f"\n  RESULTS: {model_name}")
-    print(f"  {'='*50}")
-    print(f"  Overall:  P={overall_p:.3f}  R={overall_r:.3f}  F1={overall_f1:.3f}")
-    print(f"  mAP@0.5:      {mAP50:.4f}")
-    print(f"  mAP@0.5:0.95: {mAP50_95:.4f}")
-    print(f"\n  Per-class:")
-    for pc in per_class:
-        print(f"    {pc['class']:15s}  P={pc['P']:.3f}  R={pc['R']:.3f}  F1={pc['F1']:.3f}  AP50={pc['AP50']:.3f}  AP50:95={pc['AP50_95']:.3f}")
-    print(f"\n  Day vs Night:")
-    for period, stats in day_night.items():
-        print(f"    {period:6s}: {stats['images']:3d} images  P={stats['P']:.3f}  R={stats['R']:.3f}  F1={stats['F1']:.3f}")
-
-    return {
-        'overall': overall,
-        'per_class': per_class,
-        'per_camera': per_camera,
-        'per_image': per_image,
-        'day_night': day_night,
-        'conf_analysis': conf_analysis,
-    }
-
-
-# ============================================================
-# SAVE RESULTS
-# ============================================================
-def save_results(results, prefix):
-    """Save all result tables as CSVs."""
     # Overall
-    with open(f"{RESULTS_DIR}/{prefix}_overall.csv", 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=results['overall'].keys())
-        w.writeheader()
-        w.writerow(results['overall'])
-
-    # Per-class
-    with open(f"{RESULTS_DIR}/{prefix}_per_class.csv", 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=results['per_class'][0].keys())
-        w.writeheader()
-        w.writerows(results['per_class'])
-
-    # Per-camera
-    if results['per_camera']:
-        with open(f"{RESULTS_DIR}/{prefix}_per_camera.csv", 'w', newline='') as f:
-            w = csv.DictWriter(f, fieldnames=results['per_camera'][0].keys())
-            w.writeheader()
-            w.writerows(results['per_camera'])
-
-    # Per-image
-    with open(f"{RESULTS_DIR}/{prefix}_per_image.csv", 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=results['per_image'][0].keys())
-        w.writeheader()
-        w.writerows(results['per_image'])
+    ttp = sum(class_stats[c]["TP"] for c in RF_NAMES)
+    tfp = sum(class_stats[c]["FP"] for c in RF_NAMES)
+    tfn = sum(class_stats[c]["FN"] for c in RF_NAMES)
+    op = ttp / (ttp + tfp) if (ttp + tfp) > 0 else 0
+    orr = ttp / (ttp + tfn) if (ttp + tfn) > 0 else 0
+    of1 = 2 * op * orr / (op + orr) if (op + orr) > 0 else 0
 
     # Day/Night
-    with open(f"{RESULTS_DIR}/{prefix}_day_night.csv", 'w', newline='') as f:
-        f.write("period,images,TP,FP,FN,P,R,F1\n")
-        for period, stats in results['day_night'].items():
-            f.write(f"{period},{stats['images']},{stats['TP']},{stats['FP']},{stats['FN']},"
-                    f"{stats['P']},{stats['R']},{stats['F1']}\n")
+    day_night = {}
+    for period in ["day", "night"]:
+        ps = period_stats[period]
+        ptp = sum(ps[c]["TP"] for c in RF_NAMES)
+        pfp = sum(ps[c]["FP"] for c in RF_NAMES)
+        pfn = sum(ps[c]["FN"] for c in RF_NAMES)
+        pp = ptp / (ptp + pfp) if (ptp + pfp) > 0 else 0
+        pr = ptp / (ptp + pfn) if (ptp + pfn) > 0 else 0
+        pf = 2 * pp * pr / (pp + pr) if (pp + pr) > 0 else 0
+        ni = sum(1 for d in test_data if d["period"] == period)
+        day_night[period] = {"imgs": ni, "P": pp, "R": pr, "F1": pf}
 
-    # Confidence analysis
-    with open(f"{RESULTS_DIR}/{prefix}_confidence.csv", 'w', newline='') as f:
-        w = csv.DictWriter(f, fieldnames=results['conf_analysis'][0].keys())
-        w.writeheader()
-        w.writerows(results['conf_analysis'])
+    # Per-camera
+    per_camera = []
+    for cam in sorted(camera_stats.keys(), key=lambda c: camera_stats[c]["GT"], reverse=True):
+        s = camera_stats[cam]
+        cp = s["TP"] / (s["TP"] + s["FP"]) if (s["TP"] + s["FP"]) > 0 else 0
+        cr = s["TP"] / s["GT"] if s["GT"] > 0 else 0
+        per_camera.append({"camera": cam, "GT": s["GT"], "P": cp, "R": cr})
+
+    # ================================================================
+    # PRINT RESULTS
+    # ================================================================
+    print(f"\n  Per-class results (IoU=0.5):")
+    header = f"  {'Class':18s} {'GT':>5s} {'TP':>5s} {'FP':>5s} {'FN':>5s} {'P':>7s} {'R':>7s} {'F1':>7s} {'AP@0.5':>8s} {'AP@.5:.95':>10s}"
+    print(header)
+    print(f"  {'-'*80}")
+    for pc in per_class:
+        name=pc['name']; gt=pc['GT']; tp=pc['TP']; fp=pc['FP']; fn=pc['FN']
+        p=pc['P']; r=pc['R']; f1=pc['F1']; ap50=pc['AP50']; ap5095=pc['AP50_95']
+        print(f"  {name:18s} {gt:5d} {tp:5d} {fp:5d} {fn:5d} {p:6.1%} {r:6.1%} {f1:6.1%} {ap50:7.1%} {ap5095:9.1%}")
+
+    tgt = ttp + tfn
+    print(f"\n  {'OVERALL':18s} {tgt:5d} {ttp:5d} {tfp:5d} {tfn:5d} {op:6.1%} {orr:6.1%} {of1:6.1%} {mAP50:7.1%} {mAP50_95:9.1%}")
+    print(f"\n  mAP@0.5      = {mAP50:.4f} ({mAP50:.1%})")
+    print(f"  mAP@0.5:0.95 = {mAP50_95:.4f} ({mAP50_95:.1%})")
+
+    print(f"\n  Day vs Night:")
+    for period in ["day", "night"]:
+        s = day_night[period]
+        imgs=s['imgs']; pp=s['P']; rr=s['R']; ff=s['F1']
+        print(f"    {period:6s}: {imgs:3d} imgs  P={pp:.1%}  R={rr:.1%}  F1={ff:.1%}")
+
+    print(f"\n  Per-camera (top 5):")
+    for c in per_camera[:5]:
+        cam=c['camera']; gt=c['GT']; cp=c['P']; cr=c['R']
+        print(f"    {cam[:40]:40s}  GT={gt:4d}  P={cp:.1%}  R={cr:.1%}")
+
+    return {
+        "model": model_name,
+        "overall": {"P": op, "R": orr, "F1": of1, "mAP50": mAP50, "mAP50_95": mAP50_95},
+        "per_class": per_class,
+        "day_night": day_night,
+        "per_camera": per_camera,
+        "confusion_matrix": conf_matrix,
+    }
 
 
 # ============================================================
-# COMPARISON CHARTS
+# FIX #6: Full CSV export
 # ============================================================
-def generate_comparison_charts(baseline, finetuned):
-    """Generate before vs after comparison visualisations."""
+def save_full_results(rq1, rq2):
+    """Save comprehensive CSVs for all metrics."""
 
-    classes = [pc['class'] for pc in baseline['per_class']]
-    x = np.arange(len(classes))
-    width = 0.35
-
-    # 1. Per-class AP@0.5 comparison
-    fig, ax = plt.subplots(figsize=(12, 6))
-    b_ap = [pc['AP50'] for pc in baseline['per_class']]
-    f_ap = [pc['AP50'] for pc in finetuned['per_class']]
-    bars1 = ax.bar(x - width/2, b_ap, width, label='Baseline', color='#5B9BD5')
-    bars2 = ax.bar(x + width/2, f_ap, width, label='Fine-tuned', color='#ED7D31')
-    ax.set_xlabel('Class')
-    ax.set_ylabel('AP@0.5')
-    ax.set_title('RQ1 vs RQ2: Per-Class AP@0.5 on Test Set (78 images)')
-    ax.set_xticks(x)
-    ax.set_xticklabels(classes)
-    ax.legend()
-    ax.set_ylim(0, 1.0)
-    for bar in bars1:
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                f'{bar.get_height():.1%}', ha='center', va='bottom', fontsize=9)
-    for bar in bars2:
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                f'{bar.get_height():.1%}', ha='center', va='bottom', fontsize=9)
-    plt.tight_layout()
-    plt.savefig(f'{RESULTS_DIR}/comparison_ap50_per_class.png', dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # 2. Overall metrics comparison
-    fig, ax = plt.subplots(figsize=(10, 6))
-    metrics = ['P', 'R', 'F1', 'mAP50', 'mAP50_95']
-    b_vals = [baseline['overall'][m] for m in metrics]
-    f_vals = [finetuned['overall'][m] for m in metrics]
-    x2 = np.arange(len(metrics))
-    bars1 = ax.bar(x2 - width/2, b_vals, width, label='Baseline', color='#5B9BD5')
-    bars2 = ax.bar(x2 + width/2, f_vals, width, label='Fine-tuned', color='#ED7D31')
-    ax.set_ylabel('Score')
-    ax.set_title('RQ1 vs RQ2: Overall Metrics on Test Set')
-    ax.set_xticks(x2)
-    ax.set_xticklabels(['Precision', 'Recall', 'F1', 'mAP@0.5', 'mAP@0.5:0.95'])
-    ax.legend()
-    ax.set_ylim(0, 1.0)
-    for bar in bars1:
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                f'{bar.get_height():.1%}', ha='center', va='bottom', fontsize=9)
-    for bar in bars2:
-        ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + 0.02,
-                f'{bar.get_height():.1%}', ha='center', va='bottom', fontsize=9)
-    plt.tight_layout()
-    plt.savefig(f'{RESULTS_DIR}/comparison_overall.png', dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # 3. Day vs Night comparison
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    for idx, (model_name, results) in enumerate([('Baseline', baseline), ('Fine-tuned', finetuned)]):
-        ax = axes[idx]
-        periods = ['day', 'night']
-        p_vals = [results['day_night'].get(p, {}).get('P', 0) for p in periods]
-        r_vals = [results['day_night'].get(p, {}).get('R', 0) for p in periods]
-        f_vals = [results['day_night'].get(p, {}).get('F1', 0) for p in periods]
-        x3 = np.arange(2)
-        w = 0.25
-        ax.bar(x3 - w, p_vals, w, label='Precision', color='#5B9BD5')
-        ax.bar(x3, r_vals, w, label='Recall', color='#70AD47')
-        ax.bar(x3 + w, f_vals, w, label='F1', color='#ED7D31')
-        ax.set_xticks(x3)
-        ax.set_xticklabels(['Day (07-18h)', 'Night (18-07h)'])
-        ax.set_title(f'{model_name}: Day vs Night')
-        ax.legend()
-        ax.set_ylim(0, 1.0)
-    plt.suptitle('Performance by Time of Day', fontsize=13, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig(f'{RESULTS_DIR}/comparison_day_night.png', dpi=150, bbox_inches='tight')
-    plt.close()
-
-    # 4. Save comparison CSV
-    with open(f'{RESULTS_DIR}/rq1_vs_rq2_comparison.csv', 'w', newline='') as f:
+    # 1. Overall comparison
+    with open(RESULTS_DIR / "overall_comparison.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(['metric', 'baseline', 'finetuned', 'delta'])
-        for m in ['P', 'R', 'F1', 'mAP50', 'mAP50_95']:
-            bv = baseline['overall'][m]
-            fv = finetuned['overall'][m]
-            w.writerow([m, bv, fv, round(fv - bv, 4)])
+        w.writerow(["metric", "baseline", "finetuned", "delta"])
+        for key in ["P", "R", "F1", "mAP50", "mAP50_95"]:
+            bv = rq1["overall"][key]
+            fv = rq2["overall"][key]
+            w.writerow([key, round(bv, 4), round(fv, 4), round(fv - bv, 4)])
 
-    # 5. Per-class comparison CSV
-    with open(f'{RESULTS_DIR}/rq1_vs_rq2_per_class.csv', 'w', newline='') as f:
+    # 2. Per-class with AP50 AND AP50:95 (FIX #3)
+    with open(RESULTS_DIR / "per_class_comparison.csv", "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow(['class', 'base_P', 'base_R', 'base_AP50', 'base_AP50_95',
-                     'ft_P', 'ft_R', 'ft_AP50', 'ft_AP50_95', 'delta_AP50'])
-        for bc, fc in zip(baseline['per_class'], finetuned['per_class']):
-            w.writerow([bc['class'], bc['P'], bc['R'], bc['AP50'], bc['AP50_95'],
-                        fc['P'], fc['R'], fc['AP50'], fc['AP50_95'],
-                        round(fc['AP50'] - bc['AP50'], 4)])
+        w.writerow(["class", "GT",
+                     "bl_P", "bl_R", "bl_F1", "bl_AP50", "bl_AP50_95",
+                     "ft_P", "ft_R", "ft_F1", "ft_AP50", "ft_AP50_95",
+                     "delta_AP50", "delta_AP50_95"])
+        for bp, fp in zip(rq1["per_class"], rq2["per_class"]):
+            w.writerow([bp["name"], bp["GT"],
+                        round(bp["P"],4), round(bp["R"],4), round(bp["F1"],4),
+                        round(bp["AP50"],4), round(bp["AP50_95"],4),
+                        round(fp["P"],4), round(fp["R"],4), round(fp["F1"],4),
+                        round(fp["AP50"],4), round(fp["AP50_95"],4),
+                        round(fp["AP50"]-bp["AP50"],4),
+                        round(fp["AP50_95"]-bp["AP50_95"],4)])
 
-    print(f"\n  Charts saved to {RESULTS_DIR}/")
+    # 3. Day/Night
+    with open(RESULTS_DIR / "day_night_comparison.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["period", "bl_imgs", "bl_P", "bl_R", "bl_F1",
+                     "ft_imgs", "ft_P", "ft_R", "ft_F1"])
+        for period in ["day", "night"]:
+            b = rq1["day_night"][period]
+            ft = rq2["day_night"][period]
+            w.writerow([period, b["imgs"], round(b["P"],4), round(b["R"],4), round(b["F1"],4),
+                        ft["imgs"], round(ft["P"],4), round(ft["R"],4), round(ft["F1"],4)])
+
+    # 4. Per-camera
+    with open(RESULTS_DIR / "per_camera_comparison.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["camera", "GT", "bl_P", "bl_R", "ft_P", "ft_R"])
+        bl_cams = {c["camera"]: c for c in rq1["per_camera"]}
+        for fc in rq2["per_camera"]:
+            cam = fc["camera"]
+            bc = bl_cams.get(cam, {"P": 0, "R": 0})
+            w.writerow([cam, fc["GT"],
+                        round(bc["P"],4), round(bc["R"],4),
+                        round(fc["P"],4), round(fc["R"],4)])
+
+    # 5. Confusion matrix
+    labels = [RF_NAMES[i] for i in sorted(RF_NAMES.keys())] + ["Background"]
+    np.savetxt(RESULTS_DIR / "confusion_matrix_finetuned.csv",
+               rq2["confusion_matrix"], delimiter=",", fmt="%.0f",
+               header=",".join(labels), comments="")
+
+    print(f"\n  All CSVs saved to {RESULTS_DIR}/")
 
 
 # ============================================================
-# MAIN
+# LOAD TEST DATA
 # ============================================================
-def main():
-    print("\n" + "=" * 60)
-    print("  FINAL EVALUATION: RQ1 + RQ2")
-    print("  Test-only evaluation (no training data)")
-    print("=" * 60)
+print("\n" + "=" * 70)
+print("  LOADING TEST DATASET")
+print("=" * 70)
 
-    # Load test dataset
-    dataset = collect_test_dataset(TEST_DIR)
-    print(f"\n  Test set: {len(dataset)} images")
-    day_count = sum(1 for d in dataset if d['period'] == 'day')
-    night_count = sum(1 for d in dataset if d['period'] == 'night')
-    unknown_count = sum(1 for d in dataset if d['period'] == 'unknown')
-    print(f"  Day: {day_count}, Night: {night_count}, Unknown: {unknown_count}")
-    print(f"  Cameras: {len(set(d['camera'] for d in dataset))}")
+test_data = []
+img_dir = TEST_DIR / "images"
+lbl_dir = TEST_DIR / "labels"
 
-    # Load models
-    from ultralytics import YOLO
-    print(f"\n  Loading baseline: {BASELINE_MODEL}")
-    baseline_model = YOLO(BASELINE_MODEL)
-    print(f"  Loading fine-tuned: {FINETUNED_MODEL}")
-    finetuned_model = YOLO(FINETUNED_MODEL)
+for img_path in sorted(img_dir.glob("*")):
+    if img_path.suffix.lower() not in {".jpg", ".jpeg", ".png"}:
+        continue
+    parts = img_path.stem.split("__")
+    camera = parts[0] if len(parts) >= 2 else img_path.stem.split("_")[0]
+    hour = parse_hour(img_path.name)
+    period = "day" if hour is not None and 7 <= hour < 18 else "night"
+    test_data.append({
+        "image": str(img_path), "label": str(lbl_dir / f"{img_path.stem}.txt"),
+        "filename": img_path.name, "camera": camera, "hour": hour, "period": period
+    })
 
-    # RQ1: Baseline evaluation
-    baseline_results = evaluate_model(baseline_model, dataset, "Baseline YOLOv8n", is_finetuned=False)
-    save_results(baseline_results, "rq1_baseline")
+gt_counts = defaultdict(int)
+for d in test_data:
+    for gt in load_gt(d["label"]):
+        gt_counts[gt["class"]] += 1
 
-    # RQ2: Fine-tuned evaluation
-    finetuned_results = evaluate_model(finetuned_model, dataset, "Fine-tuned YOLOv8n", is_finetuned=True)
-    save_results(finetuned_results, "rq2_finetuned")
+day_n = sum(1 for d in test_data if d["period"] == "day")
+night_n = sum(1 for d in test_data if d["period"] == "night")
+n_cams = len(set(d["camera"] for d in test_data))
+total_gt = sum(gt_counts.values())
 
-    # Comparison
-    generate_comparison_charts(baseline_results, finetuned_results)
-
-    # Final summary
-    print("\n" + "=" * 60)
-    print("  FINAL COMPARISON: BASELINE vs FINE-TUNED")
-    print("=" * 60)
-    print(f"{'Metric':<20} {'Baseline':>10} {'Fine-tuned':>12} {'Delta':>10}")
-    print("-" * 55)
-    for m in ['P', 'R', 'F1', 'mAP50', 'mAP50_95']:
-        bv = baseline_results['overall'][m]
-        fv = finetuned_results['overall'][m]
-        delta = fv - bv
-        arrow = "^" if delta > 0 else "v" if delta < 0 else "="
-        print(f"{m:<20} {bv:>9.1%} {fv:>11.1%} {arrow} {abs(delta):>8.1%}")
-
-    print(f"\n  All results saved to: {RESULTS_DIR}/")
-    print(f"  CSVs: rq1_baseline_*.csv, rq2_finetuned_*.csv, rq1_vs_rq2_*.csv")
-    print(f"  Charts: comparison_*.png")
-    print("=" * 60)
+print(f"  Test images: {len(test_data)} ({day_n} day, {night_n} night)")
+print(f"  Cameras:     {n_cams}")
+print(f"\n  Ground truth:")
+for cid in sorted(gt_counts):
+    name = RF_NAMES.get(cid, "?")
+    print(f"    {name:18s}: {gt_counts[cid]:5d}")
+print(f"    {'TOTAL':18s}: {total_gt:5d}")
 
 
-if __name__ == "__main__":
-    main()
+# ============================================================
+# RUN EVALUATIONS
+# ============================================================
+baseline_model = YOLO(BASELINE_MODEL_PATH)
+rq1 = evaluate_model(baseline_model, test_data, "Baseline YOLOv8n (COCO)", is_baseline=True)
+
+finetuned_model = YOLO(FINETUNED_MODEL_PATH)
+rq2 = evaluate_model(finetuned_model, test_data, "Fine-tuned YOLOv8s (v6, 789 imgs)", is_baseline=False)
+
+
+# ============================================================
+# COMPARISON (FIX #3: includes AP50:95)
+# ============================================================
+print(f"\n{'='*70}")
+print(f"  COMPARISON: BASELINE vs FINE-TUNED")
+print(f"{'='*70}")
+header = f"  {'Metric':<18} {'Baseline':>10} {'Fine-tuned':>12} {'Delta':>10}"
+print(header)
+print(f"  {'-'*52}")
+for key, label in [("P","Precision"),("R","Recall"),("F1","F1 Score"),
+                    ("mAP50","mAP@0.5"),("mAP50_95","mAP@0.5:0.95")]:
+    bv = rq1["overall"][key]
+    fv = rq2["overall"][key]
+    d = fv - bv
+    sign = "+" if d > 0 else ""
+    print(f"  {label:<18} {bv:>9.1%} {fv:>11.1%} {sign}{d:>8.1%}")
+
+# FIX #3: Per-class with both AP50 AND AP50:95
+print(f"\n  Per-class comparison:")
+header2 = f"  {'Class':18s} {'bl_AP50':>8s} {'ft_AP50':>8s} {'d_AP50':>8s} {'bl_AP5095':>10s} {'ft_AP5095':>10s} {'d_AP5095':>10s}"
+print(header2)
+print(f"  {'-'*68}")
+for bp, fp in zip(rq1["per_class"], rq2["per_class"]):
+    name = bp["name"]
+    b50 = bp["AP50"]; f50 = fp["AP50"]; d50 = f50 - b50
+    b95 = bp["AP50_95"]; f95 = fp["AP50_95"]; d95 = f95 - b95
+    s50 = "+" if d50 > 0 else ""
+    s95 = "+" if d95 > 0 else ""
+    print(f"  {name:18s} {b50:>7.1%} {f50:>7.1%} {s50}{d50:>7.1%} {b95:>9.1%} {f95:>9.1%} {s95}{d95:>9.1%}")
+
+
+# ============================================================
+# SAVE ALL RESULTS (FIX #6)
+# ============================================================
+save_full_results(rq1, rq2)
+
+print(f"\n{'='*70}")
+print(f"  DONE!")
+print(f"  Fixes applied: matching bug, mAP@0.5:0.95, per-class AP50:95,")
+print(f"  IMGSZ=960, confusion matrix, full CSV export")
+print(f"{'='*70}")

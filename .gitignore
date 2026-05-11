@@ -109,3 +109,7 @@ data/extra_annotation_batch/
 data/newcastle_dataset/
 data/results/
 data/
+figures/
+*.png
+*.jpg
+output.png

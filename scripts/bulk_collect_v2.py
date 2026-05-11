@@ -15,12 +15,12 @@ from pathlib import Path
 
 CAMERA_URL = "https://portal.cctv.urbanobservatory.ac.uk/latest"
 PHOTO_URL = "https://portal.cctv.urbanobservatory.ac.uk/photo"
-BASE_DIR = Path("data/uo_dataset")
+BASE_DIR = Path("data/uo_dataset_midday")
 BASE_DIR.mkdir(parents=True, exist_ok=True)
 
 HASH_FILE = BASE_DIR / "_seen_hashes.json"
 LOG_FILE = BASE_DIR / "_collection_log.json"
-TARGET = 20000
+TARGET = 10000
 POLL_INTERVAL = 300  # 5 minutes
 
 # Load existing hashes from disk
